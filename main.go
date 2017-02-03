@@ -5,21 +5,24 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/spf13/cobra"
 	"golang.org/x/net/context"
+	"golang.org/x/sync/errgroup"
 
 	"gopkg.in/telegram-bot-api.v4"
 )
@@ -50,12 +53,7 @@ func main() {
 }
 
 func Main() error {
-	flagAddr := flag.String("http", ":"+strconv.Itoa(Port), "HTTP address to listen on")
-	flagData := flag.String("data", BotBaseDir, "data path")
-	flagVerbose := flag.Bool("v", false, "verbose logging")
-	flag.Parse()
-
-	getBot := func() tgBot {
+	getBot := func(debug bool) tgBot {
 		if token == "" {
 			log.Fatal("You have to set environment variable TELEGRAM_TOKEN first!")
 		}
@@ -63,97 +61,133 @@ func Main() error {
 		if err != nil {
 			log.Fatalf("Error creating bot: %v", err)
 		}
-		ba.Debug = *flagVerbose
+		ba.Debug = debug
 		bot := tgBot{BotAPI: ba}
 		log.Printf("Bot started with %q.", bot.Self.UserName)
 		return bot
 	}
 
-	if flag.NArg() > 1 { // just send this message
-		to := flag.Arg(0)
-		text := strings.Join(flag.Args()[1:], " ")
+	mainCmd := &cobra.Command{Use: "tbot"}
+	var addr string
 
-		req, err := http.NewRequest(
-			"POST",
-			fmt.Sprintf("http://%s/%s", *flagAddr, to),
-			strings.NewReader(text),
-		)
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Printf("Calling %s", req.URL)
-		resp, err := http.DefaultClient.Do(req)
-		if resp != nil && resp.Body != nil {
+	sendMsgCmd := &cobra.Command{
+		Use:     "send",
+		Aliases: []string{"message", "msg", "m", "s"},
+		RunE: func(_ *cobra.Command, args []string) error {
+			u := addr + "/message/" + args[0]
+			resp, err := http.DefaultClient.Post(u, "text/plain", strings.NewReader(strings.Join(args[1:], " ")))
+			if err != nil {
+				return errors.Wrap(err, u)
+			}
 			defer resp.Body.Close()
-		}
-		if err == nil {
 			log.Println(resp.Status)
 			io.Copy(os.Stdout, resp.Body)
 			return nil
-		}
-		log.Println(err)
+		},
+	}
+	sendMsgCmd.Flags().StringVar(&addr, "upstream", "http://unowebprd:23456", "address of agent or proxy")
+	mainCmd.AddCommand(sendMsgCmd)
 
-		log.Println("Opening " + *flagData)
-		data, err := newDataPath(*flagData)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if err := data.Load(); err != nil {
-			log.Println(err)
-		}
-		if u := data.usersMap[to]; u != nil && u.LastChatID != 0 {
-			log.Println("Sending to " + to)
-			bot := getBot()
-			_, err = bot.Send(tgbotapi.NewMessageToChannel(fmt.Sprintf("%d", u.LastChatID), text))
-			if err == nil {
-				return nil
+	var dataDir string
+	var debug bool
+	sendDirectCmd := &cobra.Command{
+		Use:     "direct",
+		Aliases: []string{"send-direct"},
+		RunE: func(_ *cobra.Command, args []string) error {
+			log.Println("Opening " + dataDir)
+			data, err := newDataPath(dataDir)
+			if err != nil {
+				return err
 			}
-		}
-		log.Println("Saving queue")
-		data.queues[to] = append(data.queues[to], text)
-		if saveErr := data.Save(); saveErr != nil && err == nil {
-			err = saveErr
-		}
-		return err
+			if err := data.Load(); err != nil {
+				log.Println(err)
+			}
+			to := args[0]
+			if u := data.usersMap[to]; u != nil && u.LastChatID != 0 {
+				bot := getBot(debug)
+				_, err = bot.Send(tgbotapi.NewMessageToChannel(fmt.Sprintf("%d", u.LastChatID), strings.Join(args[1:], " ")))
+				return err
+			}
+			return errors.New("No chat ID for " + to)
+		},
 	}
+	sendDirectCmd.Flags().StringVar(&token, "token", os.Getenv("TELEGRAM_TOKEN"), "telegram token")
+	sendDirectCmd.Flags().StringVarP(&dataDir, "data", "d", ".", "path for data")
+	sendDirectCmd.Flags().BoolVarP(&debug, "verbose", "v", false, "verbose logging")
+	mainCmd.AddCommand(sendDirectCmd)
 
-	log.Println("Opening " + *flagData)
-	data, err := newDataPath(*flagData)
-	if err != nil {
-		log.Println(err)
+	serveCmd := &cobra.Command{
+		Use:     "serve",
+		Aliases: []string{"server", "srv", "proxy"},
+		RunE: func(_ *cobra.Command, args []string) error {
+			if len(args) < 1 {
+				return errors.New("address is needed to listen on")
+			}
+			bot := getBot(debug)
+			data, err := newDataPath(dataDir)
+			if err != nil {
+				return err
+			}
+			if err := data.Load(); err != nil {
+				log.Println(err)
+			}
+			s := srv{dataPath: data, bot: bot, agents: make(map[string]string, 8)}
+			http.Handle("/", s)
+			var grp errgroup.Group
+			grp.Go(func() error {
+				log.Println("Listening on " + args[0])
+				return http.ListenAndServe(args[0], nil)
+			})
+			grp.Go(s.Run)
+			return grp.Wait()
+		},
 	}
-	bot := getBot()
-	http.Handle("/", srv{dataPath: data, bot: bot})
-	go func() {
-		log.Println("Listening on " + *flagAddr)
-		log.Fatal(http.ListenAndServe(*flagAddr, nil))
-	}()
+	serveCmd.Flags().StringVar(&token, "token", os.Getenv("TELEGRAM_TOKEN"), "telegram token")
+	serveCmd.Flags().StringVarP(&dataDir, "data", "d", ".", "path for data")
+	serveCmd.Flags().BoolVarP(&debug, "verbose", "v", false, "verbose logging")
+	mainCmd.AddCommand(serveCmd)
 
-	if err := data.Load(); err != nil {
-		log.Println(err)
+	var upstream, name string
+	agentCmd := &cobra.Command{
+		Use: "agent",
+		RunE: func(_ *cobra.Command, args []string) error {
+			if len(args) < 1 {
+				return errors.New("address is needed to listen on")
+			}
+			return agent{upstream: upstream, name: name}.Run(args[0])
+		},
 	}
-	for to, texts := range data.queues {
-		if u := data.usersMap[to]; u != nil && u.LastChatID != 0 {
+	agentCmd.Flags().StringVarP(&upstream, "upstream", "u", "http://unowebprd.unosoft.local:23456", "upstream address")
+	agentCmd.Flags().StringVarP(&name, "name", "n", os.ExpandEnv("${BRUNO_CUS}_${BRUNO_ENV}"), "upstream address")
+	mainCmd.AddCommand(agentCmd)
+
+	return mainCmd.Execute()
+}
+
+func (s srv) Run() error {
+	for to, texts := range s.queues {
+		if u := s.usersMap[to]; u != nil && u.LastChatID != 0 {
 			remains := make([]string, 0, len(texts))
 			cid := fmt.Sprintf("%d", u.LastChatID)
 			for _, text := range texts {
-				if _, err = bot.Send(tgbotapi.NewMessageToChannel(cid, text)); err != nil {
+				if _, err := s.bot.Send(tgbotapi.NewMessageToChannel(cid, text)); err != nil {
 					remains = append(remains, text)
 				}
 			}
-			data.queues[to] = remains
+			s.queues[to] = remains
 		}
 	}
-	if err := data.Save(); err != nil {
+	if err := s.Save(); err != nil {
 		log.Println(err)
 	}
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
-	updates, err := bot.GetUpdatesChan(u)
+	updates, err := s.bot.GetUpdatesChan(u)
 	if err != nil {
 		log.Println(err)
 	}
+	var buf bytes.Buffer
 	for update := range updates {
 		msg := update.Message
 		if msg == nil {
@@ -161,51 +195,71 @@ func Main() error {
 		}
 		log.Printf("[%s] %s", msg.From.UserName, msg.Text)
 		uname := msg.From.UserName
-		u := data.usersMap[uname]
+		u := s.usersMap[uname]
 		if u == nil {
 			u = &User{Name: msg.From.UserName, Aliases: aliases[msg.From.UserName]}
-			data.users = append(data.users, *u)
-			i := len(data.users) - 1
-			data.usersMap[uname] = &data.users[i]
+			s.users = append(s.users, *u)
+			i := len(s.users) - 1
+			s.usersMap[uname] = &s.users[i]
 		}
 		if u != nil && u.LastChatID != msg.Chat.ID {
-			data.usersMap[uname].LastChatID = msg.Chat.ID
+			s.usersMap[uname].LastChatID = msg.Chat.ID
 			var remains []string
 			cid := fmt.Sprintf("%d", msg.Chat.ID)
-			for _, text := range data.queues[uname] {
-				if _, err = bot.Send(tgbotapi.NewMessageToChannel(cid, text)); err != nil {
+			for _, text := range s.queues[uname] {
+				if _, err = s.bot.Send(tgbotapi.NewMessageToChannel(cid, text)); err != nil {
 					remains = append(remains, text)
 				}
 			}
-			data.queues[uname] = remains
-			if err := data.Save(); err != nil {
+			s.queues[uname] = remains
+			if err := s.Save(); err != nil {
 				log.Println(err)
 			}
 		}
 
-		command := msg.Text
+		command, args := msg.Text, []string{}
 		if i := strings.IndexByte(command, ' '); i >= 0 {
-			command = command[:i]
+			command, args = command[:i], strings.Split(command[i+1:], " ")
 		}
-		switch command {
-		case "/help":
-			bot.Reply(msg,
+		if command == "/help" {
+			s.bot.Reply(msg,
 				`/help Show this message.
 /doku	Mi változott, mit kellene dokumentálni?
 /oerr	Oracle hibakód kereső
 /forward Forward last message.
 
 or you can send message to me, I will reply it with some debug message.`)
-		//case "/forward":
-		//bot.ForwardMessage(msg.Chat, msg.Chat, msg.ID)
-		default:
-			execute(bot, msg)
 		}
+
+		if !strings.HasPrefix(command, "/") || len(args) < 1 {
+			s.bot.Reply(msg, "/parancs <gép> [args]")
+			continue
+		}
+
+		ag := s.agents[args[0]]
+		if ag == "" {
+			s.bot.Reply(msg,
+				fmt.Sprintf("%q nem ismert gép!\nIsmertek: %s", args[0], s.agents))
+			continue
+		}
+		URL := ag + "/" + command + "?" + url.Values{"args": args[1:]}.Encode()
+		resp, err := http.Get(URL)
+		if err != nil {
+			s.bot.Reply(msg, errors.Wrap(err, URL).Error())
+			continue
+		}
+		buf.Reset()
+		_, err = io.Copy(&buf, resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Println(err)
+		}
+		s.bot.Reply(msg, buf.String())
 	}
 	return nil
 }
 
-func execute(bot tgBot, msg *tgbotapi.Message) error {
+func (ag agent) execute(bot tgBot, msg *tgbotapi.Message) error {
 	if msg.Chat.IsGroup() || msg.Text == "" {
 		return nil
 	}
@@ -275,10 +329,24 @@ func runWithContext(ctx context.Context, cmd *exec.Cmd) error {
 
 type srv struct {
 	*dataPath
-	bot tgBot
+	bot    tgBot
+	agents map[string]string
 }
 
-func (s srv) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s srv) Register(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/register/")
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	port := r.URL.Query().Get("port")
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	s.agents[name] = scheme + "://" + host + ":" + port
+	log.Printf("Registered %q to %q", name, s.agents[name])
+	fmt.Fprintf(w, "registered %q to %q", name, s.agents[name])
+}
+
+func (s srv) Message(w http.ResponseWriter, r *http.Request) {
 	if r != nil && r.Body != nil {
 		defer r.Body.Close()
 	}
@@ -320,6 +388,84 @@ func (s srv) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := s.Save(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func (s srv) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Body != nil {
+		defer r.Body.Close()
+	}
+	if r != nil && r.Method == "PUT" && strings.HasPrefix(r.URL.Path, "/register") {
+		s.Register(w, r)
+		return
+	}
+
+	if strings.HasPrefix(r.URL.Path, "/message") {
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/message")
+		s.Message(w, r)
+		return
+	}
+	if r.Method == "POST" {
+		http.Error(w, "POST needs username", http.StatusBadRequest)
+		return
+	}
+	je := json.NewEncoder(w)
+	je.Encode(s.users)
+	je.Encode(s.queues)
+	return
+}
+
+type agent struct {
+	name, upstream, port string
+}
+
+func (ag agent) Run(addr string) error {
+	_, ag.port, _ = net.SplitHostPort(addr)
+	req, err := http.NewRequest("PUT",
+		fmt.Sprintf("%s/register/%s?port=%s", ag.upstream, ag.name, ag.port), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	log.Println("Register on " + resp.Request.URL.String() + ": " + resp.Status)
+	http.Handle("/", ag)
+	log.Println("Listening on " + addr)
+	return http.ListenAndServe(addr, nil)
+}
+
+func (ag agent) Message(w http.ResponseWriter, r *http.Request) {
+	if r.Body != nil {
+		defer r.Body.Close()
+	}
+	req, err := http.NewRequest("POST", ag.upstream+path.Join("/message", r.URL.Path), r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer resp.Body.Close()
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+	return
+}
+
+func (ag agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Println(r)
+	if r != nil && r.Body != nil {
+		defer r.Body.Close()
+	}
+	if strings.HasPrefix(r.URL.Path, "/message") {
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/message")
+		ag.Message(w, r)
+		return
+	}
+
 }
 
 // vim: set fileencoding=utf-8 noet:
