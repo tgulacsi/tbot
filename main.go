@@ -420,19 +420,38 @@ type agent struct {
 
 func (ag agent) Run(addr string) error {
 	_, ag.port, _ = net.SplitHostPort(addr)
-	req, err := http.NewRequest("PUT",
-		fmt.Sprintf("%s/register/%s?port=%s", ag.upstream, ag.name, ag.port), nil)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	log.Println("Register on " + resp.Request.URL.String() + ": " + resp.Status)
-	http.Handle("/", ag)
-	log.Println("Listening on " + addr)
-	return http.ListenAndServe(addr, nil)
+	registerURL := fmt.Sprintf("%s/register/%s?port=%s", ag.upstream, ag.name, ag.port)
+	var grp errgroup.Group
+	grp.Go(func() error {
+		register := func() error {
+			req, err := http.NewRequest("PUT", registerURL, nil)
+			if err != nil {
+				log.Println(err)
+				return err
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				log.Println(err)
+				return err
+			}
+			log.Println("Register on " + resp.Request.URL.String() + ": " + resp.Status)
+			return nil
+		}
+
+		register()
+		for range time.Tick(1 * time.Minute) {
+			register()
+		}
+		return nil
+	})
+
+	grp.Go(func() error {
+		http.Handle("/", ag)
+		log.Println("Listening on " + addr)
+		return http.ListenAndServe(addr, nil)
+	})
+
+	return grp.Wait()
 }
 
 func (ag agent) Message(w http.ResponseWriter, r *http.Request) {
