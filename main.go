@@ -468,6 +468,7 @@ func (ag agent) Message(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Printf("Message %s: %s", req.URL, resp.Status)
 	defer resp.Body.Close()
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
