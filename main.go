@@ -29,22 +29,7 @@ import (
 
 //go:generate protoc --gofast_out=plugins=grpc:. ./pb/tbot.proto
 
-var (
-	token      string
-	BotBaseDir string
-	Port       = 8684
-
-	timeout = 15 * time.Second
-)
-
-func init() {
-	token = os.Getenv("TELEGRAM_TOKEN")
-	if os.Getenv("BRUNO_HOME") == "" {
-		BotBaseDir, _ = os.Getwd()
-	} else {
-		BotBaseDir = os.ExpandEnv("$BRUNO_HOME/../admin/bot")
-	}
-}
+var timeout = 15 * time.Second
 
 func main() {
 	if err := Main(); err != nil {
@@ -53,22 +38,9 @@ func main() {
 }
 
 func Main() error {
-	getBot := func(debug bool) tgBot {
-		if token == "" {
-			log.Fatal("You have to set environment variable TELEGRAM_TOKEN first!")
-		}
-		ba, err := tgbotapi.NewBotAPI(token)
-		if err != nil {
-			log.Fatalf("Error creating bot: %v", err)
-		}
-		ba.Debug = debug
-		bot := tgBot{BotAPI: ba}
-		log.Printf("Bot started with %q.", bot.Self.UserName)
-		return bot
-	}
 
 	mainCmd := &cobra.Command{Use: "tbot"}
-	var addr string
+	var addr, token string
 
 	sendMsgCmd := &cobra.Command{
 		Use:     "send",
@@ -87,6 +59,20 @@ func Main() error {
 	}
 	sendMsgCmd.Flags().StringVar(&addr, "upstream", "http://unowebprd:23456", "address of agent or proxy")
 	mainCmd.AddCommand(sendMsgCmd)
+
+	getBot := func(debug bool) tgBot {
+		if token == "" {
+			log.Fatal("You have to set environment variable TELEGRAM_TOKEN first!")
+		}
+		ba, err := tgbotapi.NewBotAPI(token)
+		if err != nil {
+			log.Fatalf("Error creating bot: %v", err)
+		}
+		ba.Debug = debug
+		bot := tgBot{BotAPI: ba}
+		log.Printf("Bot started with %q.", bot.Self.UserName)
+		return bot
+	}
 
 	var dataDir string
 	var debug bool
@@ -147,18 +133,19 @@ func Main() error {
 	serveCmd.Flags().BoolVarP(&debug, "verbose", "v", false, "verbose logging")
 	mainCmd.AddCommand(serveCmd)
 
-	var upstream, name string
+	var upstream, name, baseDir string
 	agentCmd := &cobra.Command{
 		Use: "agent",
 		RunE: func(_ *cobra.Command, args []string) error {
 			if len(args) < 1 {
 				return errors.New("address is needed to listen on")
 			}
-			return agent{upstream: upstream, name: name}.Run(args[0])
+			return agent{upstream: upstream, name: name, baseDir: baseDir}.Run(args[0])
 		},
 	}
 	agentCmd.Flags().StringVarP(&upstream, "upstream", "u", "http://unowebprd.unosoft.local:23456", "upstream address")
 	agentCmd.Flags().StringVarP(&name, "name", "n", os.ExpandEnv("${BRUNO_CUS}_${BRUNO_ENV}"), "upstream address")
+	agentCmd.Flags().StringVarP(&baseDir, "base-dir", "d", os.ExpandEnv("${BRUNO_HOME}/../admin/bot"), "path of command files")
 	mainCmd.AddCommand(agentCmd)
 
 	return mainCmd.Execute()
@@ -273,7 +260,7 @@ func (ag agent) execute(bot tgBot, msg *tgbotapi.Message) error {
 	if i := strings.IndexByte(command, ' '); i >= 0 {
 		command, args = command[:i], command[i+1:]
 	}
-	fn := filepath.Join(BotBaseDir, command+".sh")
+	fn := filepath.Join(ag.baseDir, command+".sh")
 	fi, err := os.Stat(fn)
 	if err != nil {
 		return E(errors.Wrapf(err, fn))
@@ -285,7 +272,7 @@ func (ag agent) execute(bot tgBot, msg *tgbotapi.Message) error {
 	env = append(env, "TBOT_SENDER="+msg.From.UserName)
 	var buf bytes.Buffer
 	cmd := exec.Command("sh", "-c", fn+" "+args)
-	cmd.Dir = BotBaseDir
+	cmd.Dir = ag.baseDir
 	cmd.Stdout = io.MultiWriter(&buf, os.Stdout)
 	cmd.Stderr = cmd.Stdout
 	cmd.Env = env
@@ -415,7 +402,7 @@ func (s srv) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type agent struct {
-	name, upstream, port string
+	name, upstream, port, baseDir string
 }
 
 func (ag agent) Run(addr string) error {
