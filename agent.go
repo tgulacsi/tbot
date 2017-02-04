@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -94,45 +93,39 @@ func (ag agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasPrefix(r.URL.Path, "/execute") {
+		command := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/execute"), "/", 2)[0]
+		q := r.URL.Query()
+		if err := ag.execute(w, q.Get("from"), command, q["args"]...); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	http.Error(w, r.URL.Path+" not found", http.StatusNotFound)
 }
 
-func (ag agent) execute(msg tgMsg) error {
-	if msg.IsGroup() || msg.Text == "" {
-		return nil
-	}
-	E := func(err error) error {
-		log.Printf("%v", err)
-		msg.Reply(fmt.Sprintf("%+v", err))
-		return err
-	}
-
-	command, args := strings.TrimPrefix(msg.Text, "/"), ""
-	if i := strings.IndexByte(command, ' '); i >= 0 {
-		command, args = command[:i], command[i+1:]
-	}
+func (ag agent) execute(w io.Writer, from, command string, args ...string) error {
 	fn := filepath.Join(ag.baseDir, command+".sh")
 	fi, err := os.Stat(fn)
 	if err != nil {
-		return E(errors.Wrapf(err, fn))
+		return errors.Wrapf(err, fn)
 	}
 	if fi.Mode().Perm()&0111 == 0 {
-		return E(errors.Wrapf(err, "permission=%s", fi.Mode().Perm()))
+		return errors.Wrapf(err, "permission=%s", fi.Mode().Perm())
 	}
 	env := append(make([]string, 0, len(os.Environ())+1), os.Environ()...)
-	env = append(env, "TBOT_SENDER="+msg.From.UserName)
-	var buf bytes.Buffer
+	env = append(env, "TBOT_SENDER="+from)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", fn+" "+args)
+	cmd := exec.CommandContext(ctx, "sh", "-c", fn+" "+strings.Join(args, " "))
 	cmd.Dir = ag.baseDir
-	cmd.Stdout = io.MultiWriter(&buf, os.Stdout)
-	cmd.Stderr = cmd.Stdout
+	cmd.Stdout = w
+	cmd.Stderr = w
 	cmd.Env = env
 	log.Printf("calling %q", cmd.Args)
-	if err := cmd.Run(); err != nil {
-		return E(errors.Wrapf(err, "start %q", cmd.Args))
-	}
-	return msg.Reply(buf.String())
+	err = cmd.Run()
+	return errors.Wrapf(err, "run %q", cmd.Args)
 }
 
 // vim: set fileencoding=utf-8 noet:

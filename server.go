@@ -127,7 +127,7 @@ func (s srv) Run() error {
 	var buf bytes.Buffer
 	for update := range updates {
 		msg := update.Message
-		if msg == nil {
+		if msg == nil || msg.Text == "" {
 			continue
 		}
 		log.Printf("[%s] %s", msg.From.UserName, msg.Text)
@@ -179,7 +179,11 @@ or you can send message to me, I will reply it with some debug message.`)
 				fmt.Sprintf("%q nem ismert gép!\nIsmertek: %s", args[0], s.agents))
 			continue
 		}
-		URL := ag + "/" + command + "?" + url.Values{"args": args[1:]}.Encode()
+		URL := ag + "/execute/" + command + "?" +
+			url.Values{
+				"from": {msg.From.UserName},
+				"args": args[1:],
+			}.Encode()
 		resp, err := http.Get(URL)
 		if err != nil {
 			s.bot.Reply(msg, errors.Wrap(err, URL).Error())
